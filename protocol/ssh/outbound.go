@@ -18,6 +18,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/ssh/udptunnel"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -56,6 +57,9 @@ type Outbound struct {
 	client            *ssh.Client
 	streams           int
 	closeIdle         bool
+	udpForwarding     bool
+	udpDialer         *udptunnel.Dialer
+	udpSlots          chan struct{}
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SSHOutboundOptions) (adapter.Outbound, error) {
@@ -63,8 +67,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	networks := []string{N.NetworkTCP}
+	if options.UDPForwarding {
+		networks = append(networks, N.NetworkUDP)
+	}
 	outbound := &Outbound{
-		Adapter:           outbound.NewAdapterWithDialerOptions(C.TypeSSH, tag, []string{N.NetworkTCP}, options.DialerOptions),
+		Adapter:           outbound.NewAdapterWithDialerOptions(C.TypeSSH, tag, networks, options.DialerOptions),
+		udpForwarding:     options.UDPForwarding,
+		udpSlots:          make(chan struct{}, 64),
 		logger:            logger,
 		dialer:            outboundDialer,
 		serverAddr:        options.ServerOptions.Build(),
@@ -196,6 +206,7 @@ func (s *Outbound) connect(ctx context.Context) (client *ssh.Client, err error) 
 
 	s.clientConn = conn
 	s.client = client
+	s.udpDialer = newUDPDialer(client)
 	s.streams = 1
 
 	go func() {
@@ -271,6 +282,9 @@ func (s *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (s *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if network == N.NetworkUDP {
+		return s.dialUDP(ctx, destination)
+	}
 	client, err := s.connect(ctx)
 	if err != nil {
 		return nil, err
@@ -285,7 +299,11 @@ func (s *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (s *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, os.ErrInvalid
+	conn, err := s.dialUDP(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	return &udpPacketConn{Conn: conn, destination: destination}, nil
 }
 
 type chanConnWrapper struct {

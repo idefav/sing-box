@@ -6,6 +6,7 @@ type SSHOutboundOptions struct {
 	DialerOptions
 	ServerOptions
 	User                 string                     `json:"user,omitempty"`
+	UDPForwarding        bool                       `json:"udp_forwarding,omitempty"`
 	Password             string                     `json:"password,omitempty"`
 	PrivateKey           badoption.Listable[string] `json:"private_key,omitempty"`
 	PrivateKeyPath       string                     `json:"private_key_path,omitempty"`
