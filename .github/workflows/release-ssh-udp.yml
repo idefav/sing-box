@@ -1,0 +1,117 @@
+name: SSH UDP test release
+
+on:
+  push:
+    tags:
+      - 'v*-ssh-udp.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssh-udp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Validate release tag and branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ssh-udp\.[1-9][0-9]*$ ]]
+          git merge-base --is-ancestor HEAD origin/release
+          git merge-base --is-ancestor e0ee4f251e66a29bda3c961ae11443c6cbf72978 HEAD
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.8
+      - name: Test SSH UDP transport
+        run: go test -race -count=1 ./protocol/ssh/...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: linux, arch: '386' }
+          - { os: linux, arch: arm, arm: '7', label: armv7 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+          - { os: windows, arch: '386' }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.8
+      - name: Build and package
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.arm }}
+          ARCH_LABEL: ${{ matrix.label || matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package="sing-box-${version}-${GOOS}-${ARCH_LABEL}"
+          executable=sing-box
+          if [[ "$GOOS" == windows ]]; then executable=sing-box.exe; fi
+          mkdir -p "dist/$package"
+          go build -trimpath -tags "$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS) -s -w -buildid=" \
+            -o "dist/$package/$executable" ./cmd/sing-box
+          cp LICENSE "dist/$package/"
+          if [[ "$GOOS" == windows ]]; then
+            (cd dist && zip -qr "$package.zip" "$package")
+          else
+            tar -C dist -czf "dist/$package.tar.gz" "$package"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}-${{ matrix.label || matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          [[ "$(find . -maxdepth 1 -type f | wc -l)" -eq 9 ]]
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat > RELEASE_NOTES.md <<'NOTES'
+          SSH UDP forwarding test build based on sing-box 1.14.3.
+
+          Enables opt-in `udp_forwarding` on SSH outbounds using authenticated SSH UDP channels. Requires a compatible SSH server; unsupported servers fail without falling back to direct traffic. Existing SSH profiles keep UDP disabled by default.
+
+          Includes Linux, Windows and macOS binaries with the standard non-NaiveProxy build tags. Packages are unsigned test builds. Verify downloads with SHA256SUMS.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --prerelease --latest=false --title "sing-box ${GITHUB_REF_NAME#v} (SSH UDP test)" \
+            --notes-file RELEASE_NOTES.md *.tar.gz *.zip SHA256SUMS
