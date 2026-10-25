@@ -2,8 +2,12 @@ name: SSH UDP test release
 
 on:
   push:
+    branches:
+      - release
     tags:
       - 'v*-ssh-udp.*'
+    paths:
+      - '.github/workflows/release-ssh-udp.yml'
 
 permissions:
   contents: read
@@ -15,17 +19,29 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Validate release tag and branch
+        id: release
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ssh-udp\.[1-9][0-9]*$ ]]
-          git merge-base --is-ancestor HEAD origin/release
-          git merge-base --is-ancestor e0ee4f251e66a29bda3c961ae11443c6cbf72978 HEAD
+          tag="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_REF_TYPE" == branch ]]; then
+            tag="$(git describe --tags --match 'v*-ssh-udp.*' --abbrev=0)"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ssh-udp\.[1-9][0-9]*$ ]]
+          commit="$(git rev-parse "$tag^{commit}")"
+          git merge-base --is-ancestor "$commit" origin/release
+          git merge-base --is-ancestor e0ee4f251e66a29bda3c961ae11443c6cbf72978 "$commit"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          git checkout --detach "$commit"
       - uses: actions/setup-go@v5
         with:
           go-version: 1.26.8
@@ -50,6 +66,8 @@ jobs:
           - { os: darwin, arch: arm64 }
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.test.outputs.commit }}
       - uses: actions/setup-go@v5
         with:
           go-version: 1.26.8
@@ -61,9 +79,10 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           GOARM: ${{ matrix.arm }}
           ARCH_LABEL: ${{ matrix.label || matrix.arch }}
+          RELEASE_TAG: ${{ needs.test.outputs.tag }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           package="sing-box-${version}-${GOOS}-${ARCH_LABEL}"
           executable=sing-box
           if [[ "$GOOS" == windows ]]; then executable=sing-box.exe; fi
@@ -86,7 +105,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -100,6 +119,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.test.outputs.tag }}
         run: |
           set -euo pipefail
           cd dist
@@ -112,6 +132,6 @@ jobs:
 
           Includes Linux, Windows and macOS binaries with the standard non-NaiveProxy build tags. Packages are unsigned test builds. Verify downloads with SHA256SUMS.
           NOTES
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --prerelease --latest=false --title "sing-box ${GITHUB_REF_NAME#v} (SSH UDP test)" \
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --prerelease --latest=false --title "sing-box ${RELEASE_TAG#v} (SSH UDP test)" \
             --notes-file RELEASE_NOTES.md *.tar.gz *.zip SHA256SUMS
